@@ -1,0 +1,5 @@
+dbus_service = "org.mpris.MediaPlayer2.Supersonic"
+dbus_path = "/org/mpris/MediaPlayer2"
+dbus_interface = "org.mpris.MediaPlayer2.Player"
+fg_color = "#FFFFFF"
+bg_color = "#000000"
