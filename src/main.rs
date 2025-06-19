@@ -2,7 +2,7 @@ use eframe::{
     egui::{self, CentralPanel, Color32, Context, FontId, Label, RichText},
     App, NativeOptions,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     convert::TryInto,
@@ -17,13 +17,15 @@ use zbus::{
     zvariant::{ObjectPath, OwnedValue, Value},
 };
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 struct Config {
     dbus_service: String,
     dbus_path: String,
     dbus_interface: String,
     fg_color: String,
     bg_color: String,
+    window_x: Option<i32>,
+    window_y: Option<i32>,
 }
 
 impl Config {
@@ -104,85 +106,109 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shared_clone = Arc::clone(&shared);
     let config_clone = config.clone();
     thread::spawn(move || {
-        let connection_result = Connection::session();
-        let connection = match connection_result {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Failed to connect to D-Bus: {}", e);
-                return;
-            }
-        };
-
-        let proxy_result = Proxy::new(
-            &connection,
-            BusName::try_from(config_clone.dbus_service.as_str()).unwrap(),
-            ObjectPath::try_from(config_clone.dbus_path.as_str()).unwrap(),
-            InterfaceName::try_from(config_clone.dbus_interface.as_str()).unwrap(),
-        );
-
-        let proxy = match proxy_result {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Failed to create D-Bus proxy: {}", e);
-                return;
-            }
-        };
-
         loop {
-            match proxy.get_property::<HashMap<String, Value>>("Metadata") {
-                Ok(metadata) => {
-                    let mut title = String::new();
-                    let mut artist = String::new();
+            // Try to establish D-Bus connection
+            let connection = match Connection::session() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to connect to D-Bus: {}", e);
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
 
-                    if let Some(title_value) = metadata.get("xesam:title") {
-                        // FIX: Removed redundant .clone()
-                        if let Ok(s_owned_value) = OwnedValue::try_from(title_value) {
-                            if let Ok(string_val) = TryInto::<String>::try_into(s_owned_value) {
-                                title = string_val;
-                            }
-                        }
+            // Try to create proxy with retry logic
+            let proxy = loop {
+                match Proxy::new(
+                    &connection,
+                    BusName::try_from(config_clone.dbus_service.as_str()).unwrap(),
+                    ObjectPath::try_from(config_clone.dbus_path.as_str()).unwrap(),
+                    InterfaceName::try_from(config_clone.dbus_interface.as_str()).unwrap(),
+                ) {
+                    Ok(p) => break p,
+                    Err(e) => {
+                        eprintln!("Failed to create D-Bus proxy (service may not be available): {}", e);
+                        // Clear current state when service is not available
+                        let mut state = shared_clone.lock().unwrap();
+                        state.current = None;
+                        thread::sleep(Duration::from_secs(2));
                     }
+                }
+            };
 
-                    if let Some(artist_value) = metadata.get("xesam:artist") {
-                        // FIX: Removed redundant .clone()
-                        if let Ok(artists_vec_owned_value) = OwnedValue::try_from(artist_value) {
-                            if let Ok(artists_vec) =
-                                TryInto::<Vec<String>>::try_into(artists_vec_owned_value)
-                            {
-                                if let Some(first_artist) = artists_vec.first() {
-                                    artist = first_artist.clone();
+            // Main polling loop
+            loop {
+                match proxy.get_property::<HashMap<String, Value>>("Metadata") {
+                    Ok(metadata) => {
+                        let mut title = String::new();
+                        let mut artist = String::new();
+
+                        if let Some(title_value) = metadata.get("xesam:title") {
+                            if let Ok(s_owned_value) = OwnedValue::try_from(title_value) {
+                                if let Ok(string_val) = TryInto::<String>::try_into(s_owned_value) {
+                                    title = string_val;
                                 }
                             }
                         }
-                    }
 
-                    let mut state = shared_clone.lock().unwrap();
-                    if !title.is_empty() && !artist.is_empty() {
-                        state.current = Some(NowPlaying { title, artist });
-                    } else {
-                        state.current = None;
+                        if let Some(artist_value) = metadata.get("xesam:artist") {
+                            if let Ok(artists_vec_owned_value) = OwnedValue::try_from(artist_value) {
+                                if let Ok(artists_vec) =
+                                    TryInto::<Vec<String>>::try_into(artists_vec_owned_value)
+                                {
+                                    if let Some(first_artist) = artists_vec.first() {
+                                        artist = first_artist.clone();
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut state = shared_clone.lock().unwrap();
+                        if !title.is_empty() && !artist.is_empty() {
+                            state.current = Some(NowPlaying { title, artist });
+                        } else {
+                            state.current = None;
+                        }
+                    }
+                    Err(e) => {
+                        // Check if this is a service unavailable error
+                        let error_msg = e.to_string();
+                        if error_msg.contains("ServiceUnknown") || error_msg.contains("not activatable") {
+                            // Service is no longer available, clear state and retry connection
+                            let mut state = shared_clone.lock().unwrap();
+                            state.current = None;
+                            break; // Break out of the inner loop to retry connection
+                        } else {
+                            // Other errors, just clear state but continue polling
+                            let mut state = shared_clone.lock().unwrap();
+                            state.current = None;
+                        }
                     }
                 }
-                Err(_) => {
-                    // This error can happen if the media player is closed.
-                    // We'll just clear the current state.
-                    let mut state = shared_clone.lock().unwrap();
-                    state.current = None;
-                }
+                thread::sleep(Duration::from_secs(1));
             }
-            thread::sleep(Duration::from_secs(1));
         }
     });
 
     let fg_color_parsed = Config::parse_color(&config.fg_color);
     let bg_color_parsed = Config::parse_color(&config.bg_color);
+    let window_width = 600.0;
+    let window_height = 50.0;
+    let window_x = config.window_x.unwrap_or(0) as f32;
+    let window_y = config.window_y.unwrap_or(1000) as f32;
+    
+    println!("Attempting to position window at: x={}, y={}", window_x, window_y);
+    
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 80.0])
+            .with_inner_size([window_width, window_height])
+            .with_position([window_x, window_y])
             .with_decorations(false)
             .with_always_on_top()
             .with_resizable(false)
-            .with_transparent(true), // Makes the background transparent
+            .with_transparent(true)
+            .with_taskbar(false)
+            .with_visible(true),
         ..Default::default()
     };
 
