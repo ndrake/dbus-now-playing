@@ -68,27 +68,71 @@ impl App for NowPlayingApp {
             .frame(egui::Frame::default().fill(self.bg_color))
             .show(ctx, |ui| {
                 if let Some(current) = &self.shared.lock().unwrap().current {
-                    let text = format!("{} - {}", current.artist, current.title);
-                    let label = Label::new(
-                        RichText::new(text)
-                            .font(FontId::proportional(24.0))
-                            .color(self.fg_color),
-                    );
-                    ui.with_layout(
-                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                        |ui| {
-                            ui.add(label);
-                        },
-                    );
+                    let title = &current.title;
+                    let artist = &current.artist;
+
+                    // --- Dynamic font sizing ---
+                    let max_font_size = 18.0;
+                    let min_font_size = 10.0;
+                    let padding = 10.0;
+                    let target_width = ui.available_width() - padding;
+
+                    let mut font_size = max_font_size;
+                    loop {
+                        let total_width = ctx.fonts(|fonts| {
+                            // Measure title and artist parts separately for accuracy
+                            let title_width = fonts
+                                .layout_no_wrap(
+                                    title.to_string(),
+                                    FontId::proportional(font_size),
+                                    self.fg_color,
+                                )
+                                .size()
+                                .x;
+                            let artist_width = fonts
+                                .layout_no_wrap(
+                                    format!("{}", artist), // Add the separator for measurement
+                                    FontId::proportional(font_size),
+                                    self.fg_color,
+                                )
+                                .size()
+                                .x;
+                            title_width + artist_width
+                        });
+
+                        if total_width <= target_width || font_size <= min_font_size {
+                            break;
+                        }
+                        font_size -= 1.0;
+                    }
+
+                    // --- Layout with color emphasis and guaranteed baseline alignment ---
+                    let title_color = self.fg_color;
+                    let artist_color = Color32::from_gray(180);
+
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add_space(5.0);
+                        ui.label(
+                            RichText::new(title.clone())
+                                .font(FontId::proportional(font_size))
+                                .color(title_color),
+                        );
+                        ui.label(
+                            RichText::new(format!("{}", artist))
+                                .font(FontId::proportional(font_size))
+                                .color(artist_color),
+                        );
+                    });
                 } else {
                     let label = Label::new(
                         RichText::new("No media playing")
-                            .font(FontId::proportional(18.0))
+                            .font(FontId::proportional(16.0))
                             .color(self.fg_color),
                     );
                     ui.with_layout(
-                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                        egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
+                            ui.add_space(5.0);  // 5px left padding
                             ui.add(label);
                         },
                     );
@@ -192,12 +236,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fg_color_parsed = Config::parse_color(&config.fg_color);
     let bg_color_parsed = Config::parse_color(&config.bg_color);
-    let window_width = 600.0;
-    let window_height = 50.0;
+    let window_width = 400.0;
+    let window_height = 35.0;
     let window_x = config.window_x.unwrap_or(0) as f32;
     let window_y = config.window_y.unwrap_or(1000) as f32;
     
-    println!("Attempting to position window at: x={}, y={}", window_x, window_y);
+    //println!("Attempting to position window at: x={}, y={}", window_x, window_y);
     
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()

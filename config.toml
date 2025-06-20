@@ -4,4 +4,4 @@ dbus_interface = "org.mpris.MediaPlayer2.Player"
 fg_color = "#FFFFFF"
 bg_color = "#000000"
 window_x = 0
-window_y = 1390
+window_y = 1410
