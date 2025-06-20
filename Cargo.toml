@@ -1,5 +1,5 @@
 [package]
-name = "supersonic-now-playing"
+name = "dbus-now-playing"
 version = "0.1.0"
 edition = "2021"
 
