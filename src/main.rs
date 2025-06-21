@@ -13,15 +13,12 @@ use std::{
 };
 use zbus::{
     blocking::{Connection, Proxy},
-    names::{BusName, InterfaceName},
-    zvariant::{ObjectPath, OwnedValue, Value},
+    zvariant::{OwnedValue, Value},
 };
 
 #[derive(Deserialize, Serialize, Clone)]
 struct Config {
-    dbus_service: String,
-    dbus_path: String,
-    dbus_interface: String,
+    dbus_service: Option<String>,
     fg_color: String,
     bg_color: String,
     window_x: Option<i32>,
@@ -143,6 +140,49 @@ impl App for NowPlayingApp {
     }
 }
 
+fn discover_player(connection: &Connection) -> Result<Option<String>, zbus::Error> {
+    let proxy = Proxy::new(
+        connection,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    )?;
+
+    let all_names: Vec<String> = proxy.call_method("ListNames", &())?.body().deserialize()?;
+
+    let mpris_players: Vec<String> = all_names
+        .into_iter()
+        .filter(|name| name.starts_with("org.mpris.MediaPlayer2."))
+        .collect();
+
+    if mpris_players.is_empty() {
+        return Ok(None);
+    }
+
+    let mut playing_player = None;
+    let mut paused_player = None;
+
+    for player_name in &mpris_players {
+        if let Ok(player_proxy) = Proxy::new(
+            connection,
+            player_name.as_str(),
+            "/org/mpris/MediaPlayer2",
+            "org.mpris.MediaPlayer2.Player",
+        ) {
+            if let Ok(status) = player_proxy.get_property::<String>("PlaybackStatus") {
+                if status == "Playing" {
+                    playing_player = Some(player_name.clone());
+                    break;
+                } else if status == "Paused" && paused_player.is_none() {
+                    paused_player = Some(player_name.clone());
+                }
+            }
+        }
+    }
+
+    Ok(playing_player.or(paused_player).or_else(|| mpris_players.first().cloned()))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load();
     let shared = Arc::new(Mutex::new(AppState { current: None }));
@@ -151,85 +191,110 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_clone = config.clone();
     thread::spawn(move || {
         loop {
-            // Try to establish D-Bus connection
             let connection = match Connection::session() {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to connect to D-Bus: {}", e);
-                    thread::sleep(Duration::from_secs(2));
+                    eprintln!("Failed to connect to D-Bus: {}. Retrying in 5s...", e);
+                    thread::sleep(Duration::from_secs(5));
                     continue;
                 }
             };
 
-            // Try to create proxy with retry logic
-            let proxy = loop {
-                match Proxy::new(
-                    &connection,
-                    BusName::try_from(config_clone.dbus_service.as_str()).unwrap(),
-                    ObjectPath::try_from(config_clone.dbus_path.as_str()).unwrap(),
-                    InterfaceName::try_from(config_clone.dbus_interface.as_str()).unwrap(),
-                ) {
-                    Ok(p) => break p,
-                    Err(e) => {
-                        eprintln!("Failed to create D-Bus proxy (service may not be available): {}", e);
-                        // Clear current state when service is not available
-                        let mut state = shared_clone.lock().unwrap();
-                        state.current = None;
-                        thread::sleep(Duration::from_secs(2));
-                    }
-                }
-            };
-
-            // Main polling loop
+            // --- Main Player Discovery Loop ---
             loop {
-                match proxy.get_property::<HashMap<String, Value>>("Metadata") {
-                    Ok(metadata) => {
-                        let mut title = String::new();
-                        let mut artist = String::new();
+                let service_name_to_use = if let Some(name) = &config_clone.dbus_service {
+                    Some(name.clone())
+                } else {
+                    match discover_player(&connection) {
+                        Ok(Some(name)) => Some(name),
+                        _ => None,
+                    }
+                };
 
-                        if let Some(title_value) = metadata.get("xesam:title") {
-                            if let Ok(s_owned_value) = OwnedValue::try_from(title_value) {
-                                if let Ok(string_val) = TryInto::<String>::try_into(s_owned_value) {
-                                    title = string_val;
-                                }
-                            }
+                if service_name_to_use.is_none() {
+                    let mut state = shared_clone.lock().unwrap();
+                    state.current = None;
+                    thread::sleep(Duration::from_secs(2));
+                    continue; // No player found, re-run discovery
+                }
+                
+                let service_name = service_name_to_use.unwrap();
+
+                let proxy_result = Proxy::new(
+                    &connection,
+                    service_name.as_str(),
+                    "/org/mpris/MediaPlayer2",
+                    "org.mpris.MediaPlayer2.Player",
+                );
+
+                let proxy = match proxy_result {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // Can't create proxy, player might have just closed.
+                        // Re-run discovery immediately.
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                };
+
+                // --- Track Info Polling Loop ---
+                loop {
+                    // First, check the playback status. If not "Playing", or if we get an error,
+                    // break out and re-run the discovery to find a new active player.
+                    match proxy.get_property::<String>("PlaybackStatus") {
+                        Ok(status) if status == "Playing" => {
+                            // All good, continue to get metadata.
                         }
+                        _ => {
+                            // Player is paused, stopped, or has disconnected. Time to find a new one.
+                            let mut state = shared_clone.lock().unwrap();
+                            state.current = None;
+                            break;
+                        }
+                    }
+                    
+                    match proxy.get_property::<HashMap<String, Value>>("Metadata") {
+                        Ok(metadata) => {
+                            let mut title = String::new();
+                            let mut artist = String::new();
 
-                        if let Some(artist_value) = metadata.get("xesam:artist") {
-                            if let Ok(artists_vec_owned_value) = OwnedValue::try_from(artist_value) {
-                                if let Ok(artists_vec) =
-                                    TryInto::<Vec<String>>::try_into(artists_vec_owned_value)
-                                {
-                                    if let Some(first_artist) = artists_vec.first() {
-                                        artist = first_artist.clone();
+                            if let Some(title_value) = metadata.get("xesam:title") {
+                                if let Ok(s_owned_value) = OwnedValue::try_from(title_value) {
+                                    if let Ok(string_val) = TryInto::<String>::try_into(s_owned_value) {
+                                        title = string_val;
                                     }
                                 }
                             }
-                        }
 
-                        let mut state = shared_clone.lock().unwrap();
-                        if !title.is_empty() && !artist.is_empty() {
-                            state.current = Some(NowPlaying { title, artist });
-                        } else {
-                            state.current = None;
+                            if let Some(artist_value) = metadata.get("xesam:artist") {
+                                if let Ok(artists_vec_owned_value) = OwnedValue::try_from(artist_value) {
+                                    if let Ok(artists_vec) =
+                                        TryInto::<Vec<String>>::try_into(artists_vec_owned_value)
+                                    {
+                                        if let Some(first_artist) = artists_vec.first() {
+                                            artist = first_artist.clone();
+                                        }
+                                    }
+                                }
+                            }
+
+                            let mut state = shared_clone.lock().unwrap();
+                            if !title.is_empty() && !artist.is_empty() {
+                                state.current = Some(NowPlaying { title, artist });
+                            } else {
+                                state.current = None;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        // Check if this is a service unavailable error
-                        let error_msg = e.to_string();
-                        if error_msg.contains("ServiceUnknown") || error_msg.contains("not activatable") {
-                            // Service is no longer available, clear state and retry connection
+                        Err(_) => {
+                            // This error means the player probably closed unexpectedly.
+                            // Break out to re-run discovery.
                             let mut state = shared_clone.lock().unwrap();
                             state.current = None;
-                            break; // Break out of the inner loop to retry connection
-                        } else {
-                            // Other errors, just clear state but continue polling
-                            let mut state = shared_clone.lock().unwrap();
-                            state.current = None;
+                            break;
                         }
                     }
+                    thread::sleep(Duration::from_secs(1));
                 }
-                thread::sleep(Duration::from_secs(1));
             }
         }
     });
@@ -237,7 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fg_color_parsed = Config::parse_color(&config.fg_color);
     let bg_color_parsed = Config::parse_color(&config.bg_color);
     let window_width = 400.0;
-    let window_height = 35.0;
+    let window_height = 25.0;
     let window_x = config.window_x.unwrap_or(0) as f32;
     let window_y = config.window_y.unwrap_or(1000) as f32;
     
