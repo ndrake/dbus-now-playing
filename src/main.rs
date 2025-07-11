@@ -69,7 +69,7 @@ impl App for NowPlayingApp {
                     let artist = &current.artist;
 
                     // --- Dynamic font sizing ---
-                    let max_font_size = 18.0;
+                    let max_font_size = 15.0;
                     let min_font_size = 10.0;
                     let padding = 10.0;
                     let target_width = ui.available_width() - padding;
