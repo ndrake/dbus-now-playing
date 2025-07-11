@@ -7,6 +7,7 @@ use std::{
     collections::HashMap,
     convert::TryInto,
     fs,
+    path::Path,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -25,16 +26,45 @@ struct Config {
     window_y: Option<i32>,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            dbus_service: None,
+            fg_color: "#FFFFFF".to_string(),
+            bg_color: "#000000".to_string(),
+            window_x: Some(0),
+            window_y: Some(1000),
+        }
+    }
+}
+
 impl Config {
     fn load() -> Self {
-        let content = fs::read_to_string("config.toml")
-            .expect("Failed to read config.toml. Please create one.");
-        toml::from_str(&content).expect("Failed to parse config.toml")
+        Self::load_from_file("config.toml")
+    }
+
+    fn load_from_file<P: AsRef<Path>>(path: P) -> Self {
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                match toml::from_str(&content) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        eprintln!("Failed to parse config file: {}. Using defaults.", e);
+                        Self::default()
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to read config file: {}. Using defaults.", e);
+                Self::default()
+            }
+        }
     }
 
     fn parse_color(s: &str) -> Color32 {
         let s = s.trim_start_matches('#');
         if s.len() != 6 {
+            eprintln!("Invalid color format '{}', using white", s);
             return Color32::WHITE;
         }
         let r = u8::from_str_radix(&s[0..2], 16).unwrap_or(255);
@@ -138,6 +168,31 @@ impl App for NowPlayingApp {
         // Request repaint to allow for updates from the D-Bus thread
         ctx.request_repaint_after(Duration::from_millis(500));
     }
+}
+
+fn extract_string_metadata(metadata: &HashMap<String, Value>, key: &str) -> Option<String> {
+    metadata.get(key).and_then(|value| {
+        OwnedValue::try_from(value)
+            .ok()
+            .and_then(|owned_value| TryInto::<String>::try_into(owned_value).ok())
+    })
+}
+
+fn extract_artist_metadata(metadata: &HashMap<String, Value>) -> Option<String> {
+    metadata.get("xesam:artist").and_then(|value| {
+        OwnedValue::try_from(value)
+            .ok()
+            .and_then(|owned_value| {
+                // Try to extract as Vec<String> first (most common case)
+                if let Ok(clone_value) = owned_value.try_clone() {
+                    if let Ok(artists_vec) = TryInto::<Vec<String>>::try_into(clone_value) {
+                        return artists_vec.first().cloned();
+                    }
+                }
+                // Fallback to single string
+                TryInto::<String>::try_into(owned_value).ok()
+            })
+    })
 }
 
 fn discover_player(connection: &Connection) -> Result<Option<String>, zbus::Error> {
@@ -255,31 +310,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     
                     match proxy.get_property::<HashMap<String, Value>>("Metadata") {
                         Ok(metadata) => {
-                            let mut title = String::new();
-                            let mut artist = String::new();
-
-                            if let Some(title_value) = metadata.get("xesam:title") {
-                                if let Ok(s_owned_value) = OwnedValue::try_from(title_value) {
-                                    if let Ok(string_val) = TryInto::<String>::try_into(s_owned_value) {
-                                        title = string_val;
-                                    }
-                                }
-                            }
-
-                            if let Some(artist_value) = metadata.get("xesam:artist") {
-                                if let Ok(artists_vec_owned_value) = OwnedValue::try_from(artist_value) {
-                                    if let Ok(artists_vec) =
-                                        TryInto::<Vec<String>>::try_into(artists_vec_owned_value)
-                                    {
-                                        if let Some(first_artist) = artists_vec.first() {
-                                            artist = first_artist.clone();
-                                        }
-                                    }
-                                }
-                            }
+                            let title = extract_string_metadata(&metadata, "xesam:title")
+                                .unwrap_or_else(|| "Unknown Title".to_string());
+                            let artist = extract_artist_metadata(&metadata)
+                                .unwrap_or_else(|| "Unknown Artist".to_string());
 
                             let mut state = shared_clone.lock().unwrap();
-                            if !title.is_empty() && !artist.is_empty() {
+                            if !title.is_empty() && !artist.is_empty() 
+                                && title != "Unknown Title" && artist != "Unknown Artist" {
                                 state.current = Some(NowPlaying { title, artist });
                             } else {
                                 state.current = None;
@@ -325,11 +363,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Now Playing",
         native_options,
         Box::new(move |_cc| {
-            Box::new(NowPlayingApp {
+            Ok(Box::new(NowPlayingApp {
                 shared,
                 fg_color: fg_color_parsed,
                 bg_color: bg_color_parsed,
-            })
+            }))
         }),
     )?;
 
